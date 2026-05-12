@@ -106,7 +106,7 @@ def _calc_atr(highs, lows, closes, period=14):
     return float(tr.rolling(period).mean().iloc[-1])
 
 
-def evaluate_latest_bar(df: pd.DataFrame) -> Optional[dict]:
+def _evaluate_with_thresholds(df: pd.DataFrame, alt_slope_min: float) -> Optional[dict]:
     """Fire alt-rotation signal when BTC consolidates + alt independently trends."""
     coin = df.attrs.get("coin", "")
     if not coin or coin == "BTC": return None   # Don't trade BTC itself
@@ -132,7 +132,7 @@ def evaluate_latest_bar(df: pd.DataFrame) -> Optional[dict]:
     last_c = float(closes[-1])
 
     # Step 3: Stronger slope requirement (we want clear independent trends)
-    SLOPE_MIN = STRATEGY_PARAMS.get("alt_slope_min", 0.02)   # 2% over 20 bars
+    SLOPE_MIN = alt_slope_min   # 2% over 20 bars
     slope_20 = (closes[-1] / closes[-21]) - 1 if len(closes) > 21 else 0
     is_long = alt_regime == "trend_up"
     if is_long and slope_20 < SLOPE_MIN: return None
@@ -176,3 +176,21 @@ def evaluate_latest_bar(df: pd.DataFrame) -> Optional[dict]:
         "slope_20": float(slope_20),
         "vwap_dist_pct": float((last_c - vwap) / vwap),
     }
+
+
+def evaluate_latest_bar(df) -> Optional[dict]:
+    """Tiered conviction scanner — strict (full size) + weak (quarter size)."""
+    strict_s = STRATEGY_PARAMS.get("alt_slope_min", 0.02)
+    sig = _evaluate_with_thresholds(df, strict_s)
+    if sig is not None:
+        sig["conviction"] = "strong"; sig["size_multiplier"] = 1.0
+        sig["fire_reason"] = f"{sig.get('fire_reason','')}_STRONG"
+        return sig
+    weak_s = STRATEGY_PARAMS.get("alt_slope_min_weak", 0.012)
+    if weak_s < strict_s:
+        sig = _evaluate_with_thresholds(df, weak_s)
+        if sig is not None:
+            sig["conviction"] = "weak"; sig["size_multiplier"] = 0.25
+            sig["fire_reason"] = f"{sig.get('fire_reason','')}_WEAK"
+            return sig
+    return None
