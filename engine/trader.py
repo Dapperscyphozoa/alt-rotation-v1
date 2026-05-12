@@ -24,7 +24,8 @@ from .config import (
     FIXED_NOTIONAL_USD,
     LEVERAGE, MAX_NOTIONAL_PER_TRADE, MAX_OPEN_POSITIONS, RISK_PCT_PER_TRADE,
     HALT_STATE, ACTIVE_UNIVERSE, BLOCKED_UNIVERSE,
-    TRADE_PARAMS,
+    TRADE_PARAMS, MAKER_ONLY_MODE, MAKER_TP_ENABLED, HL_BUILDER_CODE, BUILDER_KICKBACK_BPS,
+    NET_DEDUP_MODE, NET_DEDUP_THRESHOLD_USD,
     HL_WALLET, HL_PRIVATE_KEY,
     LIVE_MIN_ACCOUNT_VALUE, LIVE_SIZE_SCALE, LIVE_EXIT_SLIPPAGE, LIVE_MAKER_ONLY_ENTRIES,
 )
@@ -183,6 +184,27 @@ def attempt_trade(coin: str, signal: dict) -> dict:
                      "reason": f"cell_gated[{coin}:{cell_regime_label}:{cell_direction}]:{cell_reason}"}
     except Exception as e:
         print(f"[cell] gate error: {e}", flush=True)
+
+    # ---------- cross-engine portfolio netting ----------
+    if NET_DEDUP_MODE != "off":
+        try:
+            net = pm_client.fetch_net_position(coin)
+            if net and net.get("n_positions", 0) > 0:
+                net_dir = net.get("net_direction")
+                net_ntl = abs(net.get("net_notional") or 0)
+                my_dir = "long" if is_long else "short"
+                # Same direction with non-trivial exposure already on?
+                if net_dir == my_dir and net_ntl >= NET_DEDUP_THRESHOLD_USD:
+                    if NET_DEDUP_MODE == "skip":
+                        return {"status": "skipped",
+                                 "reason": f"net_dedup[{coin}:{my_dir}:${net_ntl:.0f}]"}
+                    elif NET_DEDUP_MODE == "size":
+                        # Halve size — already have exposure
+                        cell_size_mult = (cell_size_mult or 1.0) * 0.5
+                        print(f"[netdedup] {coin}:{my_dir} reducing size 50% "
+                              f"(net ${net_ntl:.0f} already on)", flush=True)
+        except Exception as e:
+            print(f"[netdedup] check failed: {e}", flush=True)
     # NB: ACTIVE_UNIVERSE check removed — scan loop already filters via
     # _get_active_universe() (dynamic full HL universe minus blacklist + BLOCKED).
     # The static config ACTIVE_UNIVERSE is now stale when USE_FULL_UNIVERSE=1.
@@ -565,7 +587,26 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
                   f"gross=${gross_pnl:+.4f} bars={bars_held}", flush=True)
         else:
             gross_pnl = (exit_px - entry_px) * size * direction_sign
-            fee_bps = TRADE_PARAMS["fee_bps_taker"] * 2
+            # Fee model:
+            #   default (taker entry + taker exit) = 2x taker
+            #   MAKER_ONLY_MODE (post-only entry, market exit only on SL/TIME)
+            #     - TP exit assumed maker if MAKER_TP_ENABLED, else taker
+            #     - SL/TIME exit always taker
+            #   Builder kickback: subtract BUILDER_KICKBACK_BPS from each taker leg
+            if MAKER_ONLY_MODE:
+                entry_fee = TRADE_PARAMS["fee_bps_maker"]
+                if outcome == "TP" and MAKER_TP_ENABLED:
+                    exit_fee = TRADE_PARAMS["fee_bps_maker"]
+                else:
+                    exit_fee = TRADE_PARAMS["fee_bps_taker"]
+            else:
+                entry_fee = TRADE_PARAMS["fee_bps_taker"]
+                exit_fee = TRADE_PARAMS["fee_bps_taker"]
+            # Builder kickback only applies to taker legs
+            if HL_BUILDER_CODE:
+                if entry_fee > 0: entry_fee -= BUILDER_KICKBACK_BPS
+                if exit_fee > 0:  exit_fee  -= BUILDER_KICKBACK_BPS
+            fee_bps = entry_fee + exit_fee
             fees = notional * (fee_bps / 1e4)
             persistence.close_trade(
                 cloid=cloid, exit_px=exit_px, outcome=outcome,
